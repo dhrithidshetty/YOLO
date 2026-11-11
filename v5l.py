@@ -36,7 +36,7 @@ class Config:
     data_root      : str   = "/home/ramyads/YOLO/Datasets"
     results_root   : str   = "/home/ramyads/YOLO/results"
     epochs         : int   = 200
-    batch_size     : int   = 6
+    batch_size     : int   = 8
     image_size     : int   = 640
     device         : str   = "0"
     workers        : int   = 4
