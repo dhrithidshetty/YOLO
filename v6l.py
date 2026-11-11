@@ -1,304 +1,277 @@
 
-
 import os
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ["NCCL_P2P_DISABLE"]                = "1"
-os.environ["NCCL_SHM_DISABLE"]                = "1"
-os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-os.environ["CUDA_DEVICE_ORDER"]               = "PCI_BUS_ID"
-
-import random, time, csv, yaml, zipfile
-import torch
-import torch.nn as nn
-import numpy as np
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+import argparse
+import csv
+import json
+import pprint
+import sys
+import tempfile
+import time
 from pathlib import Path
 from dataclasses import dataclass, asdict
+import yaml
+import torch
 
-torch.inference_mode = torch.no_grad
-from ultralytics import YOLO
-
-_SEED = 42
-random.seed(_SEED); np.random.seed(_SEED)
-torch.manual_seed(_SEED); torch.cuda.manual_seed_all(_SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark     = False
-
-EXP_ID   = "v6l"
-EXP_NAME = "yolov6l_pan_std"
-
-
+EXP_ID = 'v6l'
+EXP_NAME = 'yolov6l_native_std'
 
 @dataclass
 class Config:
-    dataset        : str   = "o1"
-    data_root      : str   = "/home/ramyads/YOLO/Datasets"
-    results_root   : str   = "/home/ramyads/YOLO/results"
-    epochs         : int   = 200
-    batch_size     : int   = 6
-    image_size     : int   = 640
-    device         : str   = "0"
-    workers        : int   = 4
-    lr0            : float = 0.001
-    lrf            : float = 0.05
-    weight_decay   : float = 0.0005
-    label_smoothing: float = 0.1
-    fl_gamma       : float = 1.5
-    warmup_epochs  : float = 5.0
-    warmup_momentum: float = 0.8
-    warmup_bias_lr : float = 0.1
-    fliplr         : float = 0.5
-    translate      : float = 0.1
-    scale          : float = 0.5
-    mosaic         : float = 1.0
-    close_mosaic   : int   = 30
-    copy_paste     : float = 0.3
-    copy_paste_start_epoch: int = 30
-    mixup          : float = 0.1
-    use_tta        : bool  = True
-    test_conf      : float = 0.25
-    test_iou       : float = 0.60
-    patience       : int   = 100
-    plots          : bool  = True
-    verbose        : bool  = False
-
-    def save(self, path):
-        with open(path, "w") as f:
-            yaml.dump(asdict(self), f, default_flow_style=False)
+    data: str = '/home/ramyads/YOLO/Datasets/o1/data.yaml'
+    results_root: str = '/home/ramyads/YOLO/results'
+    epochs: int = 200
+    batch: int = 8
+    imgsz: int = 640
+    device: str = '0'
+    workers: int = 4
+    weights: str = 'weights/yolov6l.pt'
+    scratch: bool = False
+    fuse_ab: bool = False
+    lr0: float = .001
+    lrf: float = .05
+    weight_decay: float = .0005
+    warmup_epochs: float = 5.
+    warmup_momentum: float = .8
+    warmup_bias_lr: float = .1
+    close_mosaic: int = 30
 
 
+def architecture(root, options):
+    from yolov6.utils.config import Config as V6Config
+    cfg = V6Config.fromfile(str(root / 'configs/yolov6l.py'))
+    weights = Path(options.weights).expanduser()
+    weights = weights if weights.is_absolute() else root / weights
+    cfg.model.pretrained = None if options.scratch else str(weights.resolve())
+    cfg.solver.optim = 'AdamW'
+    cfg.solver.lr0 = options.lr0
+    cfg.solver.lrf = options.lrf
+    cfg.solver.weight_decay = options.weight_decay
+    cfg.solver.momentum = .9
+    cfg.solver.warmup_epochs = options.warmup_epochs
+    cfg.solver.warmup_momentum = options.warmup_momentum
+    cfg.solver.warmup_bias_lr = options.warmup_bias_lr
+    cfg.data_aug.update(dict(hsv_h=0., hsv_s=0., hsv_v=0., degrees=0.,
+                             translate=.1, scale=.5, shear=0., flipud=0.,
+                             fliplr=.5, mosaic=1., mixup=.1))
+    cfg.eval_params = dict(conf_thres=.001, iou_thres=.6, do_coco_metric=False,
+                           do_pr_metric=True, plot_curve=True, plot_confusion_matrix=False)
+    return cfg
 
-def safe_worker_count(requested):
-    slurm_cpus = int(os.environ.get("SLURM_CPUS_ON_NODE", 0))
-    available  = slurm_cpus if slurm_cpus > 0 else (os.cpu_count() or 4)
-    cap        = max(1, available // 2)
-    chosen     = min(requested, cap)
-    if chosen < requested:
-        print(f"  ℹ  workers capped {requested}   {chosen}")
-    return chosen
+
+def build_adamw(cfg, model):
+    """Include every trainable parameter exactly once.
+
+    Keep native group order: no-decay, decay, biases. YOLOv6 warms up group 2
+    using warmup_bias_lr, so changing this order would change training behavior.
+    """
+    no_decay, decay, biases = [], [], []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.endswith('.bias'):
+            biases.append(parameter)
+        elif parameter.ndim < 2:
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    optimizer = torch.optim.AdamW(no_decay, lr=cfg.solver.lr0,
+                                  betas=(cfg.solver.momentum, .999), weight_decay=0.)
+    optimizer.add_param_group(dict(params=decay, weight_decay=cfg.solver.weight_decay))
+    optimizer.add_param_group(dict(params=biases, weight_decay=0.))
+    grouped = [id(p) for g in optimizer.param_groups for p in g['params']]
+    expected = {id(p) for p in model.parameters() if p.requires_grad}
+    assert len(grouped) == len(set(grouped)) and set(grouped) == expected
+    return optimizer
 
 
+def resolve_data(path):
+    """Convert an Ultralytics-style data YAML into absolute YOLOv6 directories."""
+    source = Path(path).expanduser().resolve()
+    data = yaml.safe_load(source.read_text())
+    names = data.get('names')
+    if isinstance(names, dict):
+        keys = sorted(int(k) for k in names)
+        if keys != list(range(len(keys))):
+            raise ValueError('Class name keys must be contiguous starting at zero.')
+        names = [names[k] if k in names else names[str(k)] for k in keys]
+    if not names:
+        raise ValueError('data.yaml must define class names.')
+    if 'nc' in data and int(data['nc']) != len(names):
+        raise ValueError('nc differs from the number of names.')
+    base = Path(data.get('path') or source.parent).expanduser()
+    if not base.is_absolute():
+        base = source.parent / base
+    result = dict(nc=len(names), names=names, is_coco=False)
+    for split in ('train', 'val', 'test'):
+        if not data.get(split):
+            if split != 'test':
+                raise ValueError(f'Missing {split} directory in data.yaml.')
+            continue
+        if not isinstance(data[split], str):
+            raise ValueError(f'YOLOv6 0.4.0 requires one image directory for {split}.')
+        directory = Path(data[split]).expanduser()
+        directory = (directory if directory.is_absolute() else base / directory).resolve()
+        if not directory.is_dir():
+            raise ValueError(f'{split} must point to an existing image directory: {directory}')
+        result[split] = str(directory)
+    return source, result
 
-def _is_valid_pt(path: Path) -> bool:
+
+def train_model(root, options):
+    import json
+    import pprint
+    from yolov6.core import engine
+    from yolov6.utils.envs import select_device, set_random_seed
+    from tools.train import get_args_parser
+    from tools import eval as v6eval
+    if ',' in options.device or int(os.getenv('WORLD_SIZE', '1')) != 1:
+        raise ValueError('This wrapper supports one GPU or CPU, without DDP.')
+    if tuple(int(p) for p in torch.__version__.split('+')[0].split('.')[:2]) >= (2, 6):
+        raise RuntimeError('YOLOv6 0.4.0 checkpoint loading requires this legacy setup: torch==2.5.1 and torchvision==0.20.1.')
+    if options.epochs < 1 or options.batch < 1 or options.imgsz % 32:
+        raise ValueError('Use positive epochs/batch and an image size divisible by 32.')
+    source, data = resolve_data(options.data)
+    project = Path(options.results_root).expanduser().resolve() / source.parent.name
+    run = 'exp' + EXP_ID + '_' + EXP_NAME + '_' + time.strftime('%Y%m%d_%H%M%S')
+    run_dir = project / run
+    run_dir.mkdir(parents=True, exist_ok=False)
+    data_path = run_dir / 'data_absolute.yaml'
+    data_path.write_text(yaml.safe_dump(data))
+    cfg = architecture(root, options)
+    if cfg.model.pretrained:
+        weights_path = Path(cfg.model.pretrained)
+        weights_path.parent.mkdir(parents=True, exist_ok=True)
+        if not weights_path.exists() and weights_path.name != 'yolov6l.pt':
+            raise FileNotFoundError(f'Explicit checkpoint does not exist: {weights_path}')
+    cfg_path = run_dir / 'model_config.py'
+    plain_cfg = json.loads(json.dumps(cfg._cfg_dict))
+    cfg_path.write_text('\n\n'.join(k + ' = ' + pprint.pformat(v) for k, v in plain_cfg.items()) + '\n')
+    (run_dir / 'config.yaml').write_text(yaml.safe_dump(asdict(options)))
+    args = get_args_parser().parse_args([])
+    for key, value in dict(data_path=str(data_path), conf_file=str(cfg_path),
+                          epochs=options.epochs, batch_size=options.batch, img_size=options.imgsz,
+                          workers=options.workers, device=options.device, output_dir=str(project),
+                          name=run, save_dir=str(run_dir), rank=-1, local_rank=-1, world_size=1,
+                          eval_interval=1, stop_aug_last_n_epoch=options.close_mosaic,
+                          bs_per_gpu=options.batch, fuse_ab=options.fuse_ab, distill=False).items():
+        setattr(args, key, value)
+    # bs_per_gpu=batch keeps native LR scaling at 1, preserving lr0=.001.
+    (run_dir / 'args.yaml').write_text(yaml.safe_dump(vars(args)))
+    device = select_device(options.device)
+    set_random_seed(42, deterministic=True)
+    original_optimizer = engine.build_optimizer
+    engine.build_optimizer = build_adamw
     try:
-        with zipfile.ZipFile(str(path)):
-            pass
-        return True
-    except Exception:
-        return False
-
-def _purge_corrupt_model(fname: str) -> None:
-    candidates = [Path(fname)]
-    try:
-        from ultralytics.utils import WEIGHTS_DIR
-        candidates.append(Path(WEIGHTS_DIR) / fname)
-    except ImportError:
-        pass
-    for p in candidates:
-        if p.exists() and not _is_valid_pt(p):
-            print(f"     Corrupt model cache detected: {p}")
-            try:
-                p.unlink()
-                print(f"      Deleted {p} — will re-download")
-            except OSError as e:
-                print(f"  ✗  Could not delete {p}: {e}")
-
-def safe_yolo_load(primary: str, fallback: str = None) -> YOLO:
-    for fname in filter(None, [primary, fallback]):
-        _purge_corrupt_model(fname)
-    for fname in filter(None, [primary, fallback]):
-        try:
-            m = YOLO(fname)
-            print(f"     Model loaded: {fname}")
-            return m
-        except RuntimeError as e:
-            err = str(e)
-            if "zip archive" in err or "central directory" in err:
-                print(f"  ✗ Load failed ({fname}): corrupt archive — {err}")
-                if fname == primary and fallback:
-                    print(f"  ↳ Trying fallback: {fallback}")
-                    continue
-            raise
-    raise RuntimeError(
-        f"safe_yolo_load: could not load model. "
-        f"Tried: {primary}" + (f", {fallback}" if fallback else ""))
+        trainer = engine.Trainer(args, cfg, device)
+        trainer.train()
+    finally:
+        engine.build_optimizer = original_optimizer
+    best = run_dir / 'weights/best_ckpt.pt'
+    if not best.exists():
+        raise FileNotFoundError(f'No best checkpoint was produced: {best}')
+    with (run_dir / 'evaluation.csv').open('w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['split', 'tta', 'map50', 'map50_95'])
+        for split in ['val'] + (['test'] if data.get('test') else []):
+            result, _, _ = v6eval.run(
+                data=str(data_path), weights=str(best), task=split, device=options.device,
+                batch_size=options.batch, img_size=options.imgsz, conf_thres=.001,
+                iou_thres=.6, save_dir=str(run_dir), name=split,
+                do_coco_metric=False, do_pr_metric=True, plot_curve=True,
+            )
+            writer.writerow([split, False, float(result[0]), float(result[1])])
+    # Keep the original five-column aggregate schema, test results only.
+    if data.get('test'):
+        aggregate = Path(options.results_root).expanduser().resolve() / 'all_models_metrics.csv'
+        fields = ['exp_id', 'exp_name', 'dataset', 'map50', 'map50_95']
+        if aggregate.exists():
+            with aggregate.open(newline='') as f:
+                if next(csv.reader(f), None) != fields:
+                    raise ValueError(f'Unexpected CSV header in {aggregate}; per-run evaluation.csv is already saved.')
+        new = not aggregate.exists()
+        with aggregate.open('a', newline='') as f:
+            writer = csv.writer(f)
+            if new:
+                writer.writerow(fields)
+            writer.writerow([EXP_ID, EXP_NAME, source.parent.name, float(result[0]), float(result[1])])
+    print(f'Done: {best}')
 
 
 
-class _FocalBCE(nn.Module):
-    def __init__(self, base_bce, gamma=1.5):
-        super().__init__()
-        self.gamma = gamma
-        self.reduction = base_bce.reduction
-        self.pos_weight = base_bce.pos_weight
-        self._bce_none = nn.BCEWithLogitsLoss(
-            reduction="none", pos_weight=base_bce.pos_weight)
-
-    def forward(self, pred, target):
-        loss = self._bce_none(pred, target)
-        p_t  = (torch.sigmoid(pred) * target
-                + (1 - torch.sigmoid(pred)) * (1 - target))
-        loss = (1 - p_t) ** self.gamma * loss
-        return (loss.mean() if self.reduction == "mean" else
-                loss.sum()  if self.reduction == "sum"  else loss)
-
-def _get_criterion(trainer):
-    return (getattr(trainer, "criterion", None)
-            or getattr(trainer, "compute_loss", None))
-
-def _patch_focal(trainer, gamma):
-    if gamma <= 0:
-        return
-    crit = _get_criterion(trainer)
-    for attr in ("bce", "bce_cls", "bce_obj", "cls_loss_fn"):
-        node = getattr(crit, attr, None)
-        if isinstance(node, nn.BCEWithLogitsLoss):
-            setattr(crit, attr, _FocalBCE(node, gamma))
-            print(f"     fl_gamma={gamma} patched on criterion.{attr}")
-            return
-    for cn, child in crit.named_children():
-        for attr in ("bce", "bce_cls", "bce_obj", "cls_loss_fn"):
-            node = getattr(child, attr, None)
-            if isinstance(node, nn.BCEWithLogitsLoss):
-                setattr(child, attr, _FocalBCE(node, gamma))
-                print(f"     fl_gamma={gamma} patched on criterion.{cn}.{attr}")
-                return
-    print("    fl_gamma patch: no BCEWithLogitsLoss found")
-
-def _patch_ls(trainer, ls):
-    if ls <= 0:
-        return
-    crit = _get_criterion(trainer)
-    if hasattr(crit, "label_smoothing"):
-        crit.label_smoothing = ls
-        print(f"     label_smoothing={ls} patched")
-        return
-    for cn, child in crit.named_children():
-        if hasattr(child, "label_smoothing"):
-            child.label_smoothing = ls
-            print(f"     label_smoothing={ls} patched on criterion.{cn}")
-            return
-    try:
-        crit.label_smoothing = ls
-        print(f"     label_smoothing={ls} force-set")
-    except Exception as e:
-        print(f"     label_smoothing patch failed: {e}")
-
-def make_loss_patch_cb(fl_gamma, label_smoothing):
-    patched = {"done": False}
-    def _cb(trainer):
-        if patched["done"]:
-            return
-        print("\n Loss patches (on_before_zero_grad, batch 0)")
-        _patch_focal(trainer, fl_gamma)
-        _patch_ls(trainer, label_smoothing)
-        patched["done"] = True
-    return _cb
-
-def make_copy_paste_cb(start_epoch, val):
-    def _cb(trainer):
-        if trainer.epoch == start_epoch:
-            trainer.args.copy_paste = val
-            print(f"\n     copy_paste={val} enabled at epoch {trainer.epoch}")
-    return _cb
-
-
-
-class MetricsTracker:
-    def __init__(self, base_path, dataset_name, run_name, start_time=None):
-        self.base_path    = Path(base_path)
-        self.dataset_name = dataset_name
-        self.run_name     = run_name
-        self.start_time   = start_time or time.time()
-        self.all_csv      = self.base_path / "all_models_metrics.csv"
-        self.run_dir      = self.base_path / dataset_name / run_name
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        if not self.all_csv.exists():
-            with open(self.all_csv, "w", newline="") as f:
-                csv.writer(f).writerow(
-                    ["exp_id", "exp_name", "dataset", "map50", "map50_95"])
-
-    def update(self, results):
-        map50 = map50_95 = 0.0
-        if hasattr(results, "box"):
-            map50    = float(getattr(results.box, "map50", 0.0))
-            map50_95 = float(getattr(results.box, "map",   0.0))
-        with open(self.all_csv, "a", newline="") as f:
-            csv.writer(f).writerow(
-                [EXP_ID, EXP_NAME, self.dataset_name, map50, map50_95])
-        print(f"     Test mAP50={map50:.4f}  mAP50-95={map50_95:.4f}")
-
+def smoke_test(root):
+    """Random weights and synthetic labels: no checkpoint download or dataset."""
+    from yolov6.models.yolo import build_model
+    from yolov6.models.losses.loss import ComputeLoss
+    torch.set_num_threads(min(4, os.cpu_count() or 1))
+    torch.manual_seed(42)
+    cfg = architecture(root, Config(scratch=True))
+    model = build_model(cfg, 3, torch.device('cpu'), fuse_ab=False)
+    assert type(model.backbone).__name__ == 'CSPBepBackbone'
+    assert type(model.neck).__name__ == 'CSPRepBiFPANNeck'
+    assert model.stride.tolist() == [8, 16, 32]
+    model.eval()
+    with torch.no_grad():
+        for h, w in ((128, 128), (128, 192)):
+            prediction, features = model(torch.zeros(1, 3, h, w))
+            assert prediction.shape == (1, sum((h//s)*(w//s) for s in (8, 16, 32)), 8)
+            assert [tuple(f.shape[-2:]) for f in features] == [(h//s, w//s) for s in (8, 16, 32)]
+    model.train()
+    outputs, _ = model(torch.randn(2, 3, 128, 128))
+    criterion = ComputeLoss(num_classes=3, ori_img_size=128, warmup_epoch=0, use_dfl=True, reg_max=16)
+    targets = torch.tensor([[0, 1, .5, .5, .2, .2], [1, 2, .3, .4, .1, .15]])
+    loss, parts = criterion(outputs, targets, epoch_num=1, step_num=0)
+    assert torch.isfinite(loss).all() and torch.isfinite(parts).all()
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detect.parameters())
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    optimizer = build_adamw(cfg, model)  # Checks complete parameter coverage.
+    del optimizer, outputs, loss
+    model.zero_grad(set_to_none=True)
+    model.eval()
+    model.nc, model.names = 3, ['a', 'b', 'c']
+    with torch.no_grad(), tempfile.TemporaryDirectory() as td:
+        x = torch.zeros(1, 3, 128, 128)
+        expected = model(x)[0]
+        ckpt = Path(td) / 'test.pt'
+        torch.save({'model': model, 'ema': None}, ckpt)
+        from yolov6.utils.checkpoint import load_checkpoint
+        restored = load_checkpoint(str(ckpt), map_location='cpu', fuse=False)
+        torch.testing.assert_close(expected, restored(x)[0])
+    print('PASS: stock architecture, output shapes, native loss/backward, optimizer coverage, checkpoint reload.')
 
 
 def main():
-    total_start = time.time()
-    cfg         = Config()
-    cfg.workers = safe_worker_count(cfg.workers)
-
-    data_yaml    = Path(cfg.data_root) / cfg.dataset / "data.yaml"
-    results_base = Path(cfg.results_root)
-    results_base.mkdir(parents=True, exist_ok=True)
-    if not data_yaml.exists():
-        raise FileNotFoundError(f"data.yaml not found: {data_yaml}")
-
-    job_id   = os.environ.get("SLURM_JOB_ID", f"local_{int(time.time())}")
-    run_name = f"exp{EXP_ID}_{EXP_NAME}_{job_id}"
-    tracker  = MetricsTracker(results_base, cfg.dataset, run_name, total_start)
-    cfg.save(tracker.run_dir / "config.yaml")
-
-    print("=" * 65)
-    print(f"  EXP #{EXP_ID} — {EXP_NAME.upper()}")
-    print(f"  Backbone : YOLOv6l (EfficientRep/CSPStackRep, pretrained COCO)")
-    print(f"  Neck: Rep-PAN   Head: Efficient decoupled Detect")
-    print(f"  Epochs: {cfg.epochs}  Batch: {cfg.batch_size}  Device: {cfg.device}")
-    print(f"  Comparison anchor: exp01 (YOLOv8l-PAN-Std)")
-    print("=" * 65)
-
-    
-    
-    model = safe_yolo_load("yolov6l.pt")
-
-    model.add_callback("on_before_zero_grad",
-                       make_loss_patch_cb(cfg.fl_gamma, cfg.label_smoothing))
-    model.add_callback("on_train_epoch_start",
-                       make_copy_paste_cb(cfg.copy_paste_start_epoch,
-                                          cfg.copy_paste))
-
-    model.train(
-        data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.image_size,
-        batch=cfg.batch_size, device=cfg.device, workers=cfg.workers,
-        project=str(results_base / cfg.dataset), name=run_name,
-        exist_ok=True, save=True, save_period=0,
-        verbose=cfg.verbose, plots=cfg.plots, freeze=0,
-        optimizer="AdamW", lr0=cfg.lr0, lrf=cfg.lrf,
-        weight_decay=cfg.weight_decay,
-        warmup_epochs=cfg.warmup_epochs, warmup_momentum=cfg.warmup_momentum,
-        warmup_bias_lr=cfg.warmup_bias_lr,
-        fliplr=cfg.fliplr, translate=cfg.translate, scale=cfg.scale,
-        mosaic=cfg.mosaic, close_mosaic=cfg.close_mosaic,
-        copy_paste=0.0, mixup=cfg.mixup,          
-        hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
-        degrees=0.0, shear=0.0, perspective=0.0, flipud=0.0,
-        patience=cfg.patience, cos_lr=True, seed=_SEED,
-    )
-
-    best       = results_base / cfg.dataset / run_name / "weights" / "best.pt"
-    best_model = YOLO(str(best))
-
-    best_model.val(data=str(data_yaml), imgsz=cfg.image_size,
-                   batch=cfg.batch_size, device=cfg.device, split="val")
-
-    test_dir = Path(cfg.data_root) / cfg.dataset / "images" / "test"
-    if test_dir.exists():
-        res = best_model.val(data=str(data_yaml), split="test",
-                             imgsz=cfg.image_size, batch=cfg.batch_size,
-                             device=cfg.device, augment=cfg.use_tta)
-        tracker.update(res)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--smoke-test', action='store_true')
+    parser.add_argument('--data', default=Config.data)
+    parser.add_argument('--results-root', default=Config.results_root)
+    parser.add_argument('--device', default=Config.device)
+    parser.add_argument('--epochs', type=int, default=Config.epochs)
+    parser.add_argument('--batch-size', type=int, default=Config.batch)
+    parser.add_argument('--workers', type=int, default=Config.workers)
+    parser.add_argument('--weights', default=Config.weights)
+    parser.add_argument('--scratch', action='store_true')
+    parser.add_argument('--fuse-ab', action='store_true', help='Enable native anchor-aided auxiliary training.')
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent
+    if not (root / 'yolov6/models/yolo.py').is_file():
+        raise SystemExit('Save this file in the root of a meituan/YOLOv6 tag 0.4.0 checkout.')
+    os.chdir(root)
+    if args.smoke_test:
+        smoke_test(root)
     else:
-        print(f"     test dir not found, skipping test eval: {test_dir}")
+        # SLURM_CPUS_ON_NODE may contain a suffix such as 8(x2).
+        import re
+        raw = os.getenv('SLURM_CPUS_ON_NODE', '')
+        matched = re.match(r'\d+', raw)
+        available = int(matched.group()) if matched else (os.cpu_count() or 4)
+        workers = min(max(0, args.workers), max(1, available // 2))
+        train_model(root, Config(data=args.data, results_root=args.results_root,
+                                epochs=args.epochs, batch=args.batch_size, device=args.device,
+                                workers=workers, weights=args.weights, scratch=args.scratch,
+                                fuse_ab=args.fuse_ab))
 
-    elapsed = (time.time() - total_start) / 3600
-    print(f"\n   Exp #{EXP_ID} done in {elapsed:.2f} h     {tracker.run_dir}")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
